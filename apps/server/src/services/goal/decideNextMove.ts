@@ -5,7 +5,12 @@ import type {
   GoalTickBranch,
   GoalTickOutcome,
 } from '@lobechat/agent-tracing';
-import { GOAL_ACCEPTANCE_TASK_TITLE } from '@lobechat/const/goal';
+import {
+  GOAL_ACCEPTANCE_TASK_TITLE,
+  LEASE_EXPIRED_ERROR,
+  VERIFICATION_ERRORED_ERROR,
+  VERIFICATION_FAILED_ERROR,
+} from '@lobechat/const/goal';
 import type {
   GoalGraphNode,
   GoalGraphSnapshot,
@@ -17,8 +22,7 @@ import { toMetricScale } from '@lobechat/types';
 export { GOAL_ACCEPTANCE_TASK_TITLE } from '@lobechat/const/goal';
 
 /** Reason strings the recovery paths key off, written by the settle path. */
-export const LEASE_EXPIRED_ERROR = 'Goal Task operation lease expired.';
-export const VERIFICATION_FAILED_ERROR = 'Delivery did not pass verification.';
+export { LEASE_EXPIRED_ERROR, VERIFICATION_ERRORED_ERROR, VERIFICATION_FAILED_ERROR };
 
 export const TERMINAL_NODE_STATUSES = new Set(['resolved', 'rejected', 'retired']);
 
@@ -89,7 +93,11 @@ export const needsBudget = (task?: TaskItem | null): boolean => {
   if (task === null) return false;
   // A failure the coordinator can retry spends money too.
   if (task.status === 'paused') {
-    return task.error === LEASE_EXPIRED_ERROR || task.error === VERIFICATION_FAILED_ERROR;
+    return (
+      task.error === LEASE_EXPIRED_ERROR ||
+      task.error === VERIFICATION_FAILED_ERROR ||
+      task.error === VERIFICATION_ERRORED_ERROR
+    );
   }
   return !['completed', 'failed', 'canceled', 'running', 'scheduled'].includes(task.status);
 };
@@ -406,6 +414,40 @@ const decideWithoutFrontier = (
     };
   }
 
+  if (
+    graph.nodes.some(
+      (node) => node.kind === 'experiment' && !TERMINAL_NODE_STATUSES.has(node.status),
+    )
+  ) {
+    return {
+      ...base,
+      branch: 'no_frontier',
+      outcome: 'no_progress',
+      message: 'An experiment still has unfinished work or an empty branch',
+    };
+  }
+
+  // Exploration consumes real completed results before deciding whether to
+  // extend the graph or hand the deliverable to the ordinary acceptance gate.
+  if (
+    graph.goal.config?.exploration &&
+    !(
+      graph.goal.config.exploration.checkpoint?.readyForAcceptance &&
+      taskNodes.every(
+        (node) =>
+          node.title === GOAL_ACCEPTANCE_TASK_TITLE ||
+          graph.goal.config!.exploration!.checkpoint!.reviewedNodeIds?.includes(node.id),
+      )
+    )
+  ) {
+    return {
+      ...base,
+      branch: 'explore_graph',
+      message: 'Evaluate completed experiments and choose the next graph expansion',
+      outcome: 'advanced',
+    };
+  }
+
   // Measured clauses gate the delivery contract, and are checked before it:
   // an unmet number is not something a verifier can talk its way past, so
   // creating (or re-running) the acceptance Task against it would only spend
@@ -474,7 +516,9 @@ const decideForTask = (
     if (
       budget?.deadlinePassed &&
       task.status === 'paused' &&
-      (task.error === LEASE_EXPIRED_ERROR || task.error === VERIFICATION_FAILED_ERROR)
+      (task.error === LEASE_EXPIRED_ERROR ||
+        task.error === VERIFICATION_FAILED_ERROR ||
+        task.error === VERIFICATION_ERRORED_ERROR)
     ) {
       return {
         ...base,
@@ -492,12 +536,22 @@ const decideForTask = (
         outcome: 'waiting_external',
       };
     }
-    if (task.status === 'paused' && task.error === VERIFICATION_FAILED_ERROR) {
+    // A verifier that could not run never evaluated the delivery, so it is an
+    // infrastructure failure rather than a verdict. It recovers the same way a
+    // rejection does; without a branch it fell through to the human gate, which
+    // stopped the goal on a failure nobody needed to judge.
+    if (
+      task.status === 'paused' &&
+      (task.error === VERIFICATION_FAILED_ERROR || task.error === VERIFICATION_ERRORED_ERROR)
+    ) {
       if (!capacity) return 'needs-capacity';
       return {
         ...base,
         branch: 'recover_verification',
-        message: `Task ${task.identifier} did not pass verification`,
+        message:
+          task.error === VERIFICATION_ERRORED_ERROR
+            ? `Verification could not run for Task ${task.identifier}`
+            : `Task ${task.identifier} did not pass verification`,
         outcome: 'waiting_external',
       };
     }

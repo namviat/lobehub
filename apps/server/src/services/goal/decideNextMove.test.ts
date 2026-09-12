@@ -1,3 +1,4 @@
+import { VERIFICATION_UNJUDGEABLE_ERROR } from '@lobechat/const/goal';
 import type { GoalGraphNode, GoalGraphSnapshot, TaskItem } from '@lobechat/types';
 import { describe, expect, it } from 'vitest';
 
@@ -10,6 +11,7 @@ import {
   needsBudget,
   needsMetricCriteria,
   selectFrontier,
+  VERIFICATION_ERRORED_ERROR,
   VERIFICATION_FAILED_ERROR,
 } from './decideNextMove';
 
@@ -177,9 +179,29 @@ describe('decideNextMove', () => {
         }).branch,
       ).toBe('recover_verification');
 
+      // A verifier that crashed never judged the delivery, so it recovers like a
+      // rejection instead of stopping the goal on a verdict nobody reached.
+      expect(
+        decide(snapshot, {
+          frontierTask: task({ error: VERIFICATION_ERRORED_ERROR, status: 'paused' }),
+        }),
+      ).toMatchObject({
+        branch: 'recover_verification',
+        message: 'Verification could not run for Task T-1',
+      });
+
       expect(
         decide(snapshot, { frontierTask: task({ error: 'Device offline', status: 'failed' }) }),
       ).toMatchObject({ branch: 'failure_decision', message: 'Device offline' });
+
+      // A criterion the review cannot settle by reading is NOT recoverable: the
+      // builder would re-deliver the same artifacts against the same unprovable
+      // check, so this one belongs to a person on the first occurrence.
+      expect(
+        decide(snapshot, {
+          frontierTask: task({ error: VERIFICATION_UNJUDGEABLE_ERROR, status: 'paused' }),
+        }),
+      ).toMatchObject({ branch: 'failure_decision', outcome: 'waiting_human' });
     });
 
     it('treats a plain pause as waiting on a person and a run as waiting on the world', () => {
@@ -542,5 +564,39 @@ describe('measured acceptance', () => {
         },
       }),
     ).toMatchObject({ branch: 'terminal_acceptance', outcome: 'advanced' });
+  });
+});
+
+describe('exploration terminal phase', () => {
+  const explorationGraph = () => {
+    const snapshot = graph({ nodes: [node('baseline', { status: 'resolved' })] });
+    snapshot.goal.requirement = 'Deliver proven result';
+    snapshot.goal.config = {
+      exploration: { instruction: 'Compare experiments', maxExperiments: 3 },
+    };
+    return snapshot;
+  };
+  it('expands a finished experiment instead of accepting a completed task list', () => {
+    expect(decide(explorationGraph()).branch).toBe('explore_graph');
+  });
+  it('hands a reviewed search to independent acceptance and reopens when new experiments appear', () => {
+    const snapshot = explorationGraph();
+    snapshot.goal.config!.exploration!.checkpoint = {
+      token: 'lease',
+      snapshot: 'hash',
+      expiresAt: '2026-09-08T00:00:00Z',
+      readyForAcceptance: true,
+      reviewedNodeIds: ['baseline'],
+    };
+    expect(decide(snapshot).branch).toBe('terminal_acceptance');
+    snapshot.nodes.push(node('new-result', { status: 'resolved' }));
+    expect(decide(snapshot).branch).toBe('explore_graph');
+  });
+  it('waits for a running experiment and preserves the task retry path', () => {
+    const snapshot = explorationGraph();
+    snapshot.nodes[0] = node('baseline', { status: 'active', taskId: 'task_1' });
+    expect(decide(snapshot, { frontierTask: task({ status: 'running' }) }).branch).not.toBe(
+      'explore_graph',
+    );
   });
 });

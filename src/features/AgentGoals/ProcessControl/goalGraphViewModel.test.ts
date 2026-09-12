@@ -1,3 +1,4 @@
+import { GOAL_ACCEPTANCE_TASK_TITLE } from '@lobechat/const/goal';
 import type {
   GoalGraphDecision,
   GoalGraphEdge,
@@ -8,7 +9,13 @@ import type {
 } from '@lobechat/types';
 import { describe, expect, it } from 'vitest';
 
-import { buildGoalGraphView, hasReviewableResult, isTroubledTaskNode } from './goalGraphViewModel';
+import { experimentRelations, graphNodeKind, isExperiment } from '../Experiments/model';
+import {
+  buildGoalGraphView,
+  hasReviewableResult,
+  isRunningNode,
+  isTroubledTaskNode,
+} from './goalGraphViewModel';
 
 const T0 = new Date('2026-08-01T00:00:00Z');
 const at = (minutes: number) => new Date(T0.getTime() + minutes * 60_000);
@@ -568,6 +575,40 @@ describe('isTroubledTaskNode', () => {
   });
 });
 
+describe('isRunningNode', () => {
+  it('reads an active task as running', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        events: [event('w1', 'activated', 110)],
+        nodes: [node('w1', { status: 'active', updatedAt: at(115) })],
+      }),
+      NOW,
+    );
+
+    expect(isRunningNode(view.byId.w1)).toBe(true);
+  });
+
+  // An open question is not work in flight — the card already says it is
+  // unanswered, and a running chip there promises activity nobody is doing.
+  it('never reads a question as running', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('p1', { kind: 'problem', status: 'active', updatedAt: at(115) })] }),
+      NOW,
+    );
+
+    expect(isRunningNode(view.byId.p1)).toBe(false);
+  });
+
+  it('does not read a stale task as running', () => {
+    const view = buildGoalGraphView(
+      snapshot({ nodes: [node('w1', { status: 'active', updatedAt: at(0) })] }),
+      NOW,
+    );
+
+    expect(isRunningNode(view.byId.w1)).toBe(false);
+  });
+});
+
 describe('hasReviewableResult', () => {
   // The graph drill-down routes on this: only a Task with a delivery to read
   // opens the result surface; everything else opens the original Task detail.
@@ -638,5 +679,41 @@ describe('hasReviewableResult', () => {
 
     expect(view.byId.w1.isStale).toBe(true);
     expect(hasReviewableResult(view.byId.w1)).toBe(false);
+  });
+});
+
+describe('experiment navigation', () => {
+  it('keeps historical branching separate from dependencies and excludes terminal acceptance', () => {
+    const view = buildGoalGraphView(
+      snapshot({
+        goal: goal({ config: { exploration: { instruction: 'Compare', maxExperiments: 3 } } }),
+        nodes: [
+          node('first', { kind: 'experiment' }),
+          node('second', { kind: 'experiment' }),
+          node('third', { kind: 'experiment' }),
+          node('acceptance', { title: GOAL_ACCEPTANCE_TASK_TITLE }),
+        ],
+        edges: [
+          edge('second', 'first', 'derived_from'),
+          edge('third', 'first', 'derived_from'),
+          edge('third', 'second', 'depends_on'),
+        ],
+      }),
+      NOW,
+    );
+    expect(experimentRelations(view, 'third').parents.map((v) => v.node.id)).toEqual(['first']);
+    expect(experimentRelations(view, 'first').children.map((v) => v.node.id)).toEqual([
+      'second',
+      'third',
+    ]);
+    expect(graphNodeKind(view, view.byId.first)).toBe('experiment');
+    expect(graphNodeKind(view, view.byId.acceptance)).toBe('task');
+    expect(isExperiment(view, view.byId.acceptance)).toBe(false);
+    expect(view.nodes.filter((v) => isExperiment(view, v))).toHaveLength(3);
+  });
+  it('does not reclassify ordinary Goal tasks as experiments', () => {
+    const view = buildGoalGraphView(snapshot({ nodes: [node('task')] }), NOW);
+    expect(graphNodeKind(view, view.byId.task)).toBe('task');
+    expect(isExperiment(view, view.byId.task)).toBe(false);
   });
 });

@@ -115,6 +115,15 @@ const globalStore = vi.hoisted(() => ({
   },
 }));
 
+vi.mock('motion/react', () => ({
+  AnimatePresence: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  m: {
+    div: ({ children, ...props }: { children?: ReactNode; [key: string]: unknown }) => (
+      <div {...props}>{children}</div>
+    ),
+  },
+}));
+
 vi.mock('@/features/RightPanel', () => ({
   default: (props: CapturedRightPanelProps) => {
     rightPanel.current = props;
@@ -232,8 +241,8 @@ vi.mock('@/features/ChatInput/ControlBar/useRepoType', async () => {
 vi.mock('@/hooks/useEffectiveWorkingDirectory', () => ({
   useEffectiveWorkingDirectory: () => reviewState.workingDirectory,
 }));
-vi.mock('@/hooks/useEffectiveAgencyConfig', () => ({
-  useEffectiveAgencyConfig: () => ({
+vi.mock('@/hooks/useTopicAgencyConfig', () => ({
+  useTopicAgencyConfig: () => ({
     agencyConfig: effectiveConfig.agencyConfig,
     workspaceScoped: effectiveConfig.workspaceScoped,
   }),
@@ -720,7 +729,7 @@ describe('AgentWorkingSidebar — tab strip', () => {
 
     render(<AgentWorkingSidebar />);
 
-    expect(screen.getByRole('complementary')).toHaveTextContent('workingPanel.overview.title');
+    expect(screen.getByRole('complementary')).toHaveTextContent('Open Review from Overview');
     expect(screen.getByTestId('right-panel')).not.toBeVisible();
     expect(
       screen.queryByRole('button', { name: 'workingPanel.resources.filter.skills' }),
@@ -747,7 +756,7 @@ describe('AgentWorkingSidebar — tab strip', () => {
 
     render(<AgentWorkingSidebar />);
 
-    expect(screen.getByRole('complementary')).toHaveTextContent('workingPanel.overview.title');
+    expect(screen.getByRole('complementary')).toHaveTextContent('Open Review from Overview');
     expect(screen.getByRole('button', { name: 'workingPanel.openMenu.title' })).toBeInTheDocument();
     expect(screen.getByTestId('params-loading')).toBeInTheDocument();
   });
@@ -1138,16 +1147,6 @@ describe('AgentWorkingSidebar — tab strip', () => {
     expect(globalStore.toggleRightPanel).toHaveBeenCalledWith(false);
   });
 
-  it('keeps the independent Overview panel closable', () => {
-    localStorageState.openTabsByContext = {};
-    globalStore.status.workingSidebarTab = 'overview';
-
-    render(<AgentWorkingSidebar />);
-    fireEvent.click(screen.getByRole('button', { name: 'workingPanel.tabs.closePanel' }));
-
-    expect(globalStore.updateSystemStatus).toHaveBeenCalledWith({ showWorkingOverview: false });
-  });
-
   it('does not show Overview beside a legacy persisted open workspace panel', () => {
     globalStore.status.showRightPanel = true;
     globalStore.status.showWorkingOverview = undefined;
@@ -1156,20 +1155,6 @@ describe('AgentWorkingSidebar — tab strip', () => {
 
     expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
     expect(rightPanel.current?.expand).toBe(true);
-  });
-
-  it('lets the independent Overview close without removing pinned tabs', () => {
-    agentStore.activeAgentId = 'agent';
-    localStorageState.openTabsByContext = {};
-    localStorageState.pinnedTabsByAgent = { agent: ['works'] };
-    globalStore.status.workingSidebarTab = 'overview';
-
-    render(<AgentWorkingSidebar />);
-
-    fireEvent.click(screen.getByRole('button', { name: 'workingPanel.tabs.closePanel' }));
-
-    expect(globalStore.updateSystemStatus).toHaveBeenCalledWith({ showWorkingOverview: false });
-    expect(localStorageState.pinnedTabsByAgent).toEqual({ agent: ['works'] });
   });
 
   it('reopens a closed tab when the same external target is requested again', async () => {

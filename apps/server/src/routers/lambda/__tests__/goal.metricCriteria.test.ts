@@ -2,17 +2,24 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('@/database/core/db-adaptor', () => ({
-  getServerDB: vi.fn(() => ({})),
+  getServerDB: vi.fn(function () {
+    return {};
+  }),
 }));
 
 vi.mock('@/business/server/trpc-middlewares/rbacPermission', () => ({
-  withScopedPermission: vi.fn(() => (opts: any) => opts.next({ ctx: opts.ctx })),
+  withScopedPermission: vi.fn(function () {
+    return (opts: any) => opts.next({ ctx: opts.ctx });
+  }),
 }));
 
-vi.mock('@/business/server/trpc-middlewares/workspaceAuth', async () => {
+vi.mock('@/business/server/trpc-middlewares/workspaceAuth', async (importOriginal) => {
   const { authedProcedure } = await import('@/libs/trpc/lambda');
-  return { wsCompatProcedure: authedProcedure };
+  return { ...(await importOriginal<object>()), wsCompatProcedure: authedProcedure };
 });
+
+// Router contract tests do not launch an Agent runtime.
+vi.mock('@/server/services/aiAgent', () => ({ AiAgentService: vi.fn() }));
 
 const mockCreate = vi.fn();
 const mockSetMetricCriteria = vi.fn();
@@ -20,15 +27,19 @@ const mockRecordObservation = vi.fn();
 const mockFindById = vi.fn();
 
 vi.mock('@/server/services/goal', () => ({
-  GoalService: vi.fn(() => ({
-    create: mockCreate,
-    recordObservation: mockRecordObservation,
-    setMetricCriteria: mockSetMetricCriteria,
-  })),
+  GoalService: vi.fn(function () {
+    return {
+      create: mockCreate,
+      recordObservation: mockRecordObservation,
+      setMetricCriteria: mockSetMetricCriteria,
+    };
+  }),
 }));
 
 vi.mock('@/database/models/goal', () => ({
-  GoalModel: vi.fn(() => ({ findById: mockFindById })),
+  GoalModel: vi.fn(function () {
+    return { findById: mockFindById };
+  }),
 }));
 
 const mockScheduleGoalAdvance = vi.fn();
@@ -50,6 +61,21 @@ describe('goalRouter numeric acceptance', () => {
     mockRecordObservation.mockResolvedValue({ point: {}, series: {}, shouldAdvance: true });
   });
 
+  it('accepts planning limits without a separately configured manager identity', async () => {
+    await caller.create({
+      agentId: 'task-worker',
+      createdByAgentId: 'creating-agent',
+      config: { manager: { maxTurns: 5 } },
+      title: 'Creator-managed goal',
+    });
+    expect(mockCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        createdByAgentId: 'creating-agent',
+        config: { manager: { maxTurns: 5 } },
+      }),
+    );
+  });
+
   it('carries measured clauses through the create contract', async () => {
     // Zod strips unknown keys, so a clause absent from the schema would reach
     // the service as `undefined` and leave the gate unreachable in production
@@ -66,15 +92,31 @@ describe('goalRouter numeric acceptance', () => {
     );
   });
 
-  it('declares clauses after creation', async () => {
+  it('declares clauses after creation, defaulting to replace mode', async () => {
     await caller.setMetricCriteria({
       id: 'goal_1',
       metrics: [{ key: 'churn', op: 'lte', target: 5 }],
     });
 
-    expect(mockSetMetricCriteria).toHaveBeenCalledWith('goal_1', [
-      { key: 'churn', op: 'lte', target: 5 },
-    ]);
+    expect(mockSetMetricCriteria).toHaveBeenCalledWith(
+      'goal_1',
+      [{ key: 'churn', op: 'lte', target: 5 }],
+      undefined,
+    );
+  });
+
+  it('passes merge mode through, so single-clause declares upsert server-side', async () => {
+    await caller.setMetricCriteria({
+      id: 'goal_1',
+      metrics: [{ key: 'churn', op: 'lte', target: 5 }],
+      mode: 'merge',
+    });
+
+    expect(mockSetMetricCriteria).toHaveBeenCalledWith(
+      'goal_1',
+      [{ key: 'churn', op: 'lte', target: 5 }],
+      'merge',
+    );
   });
 
   it('rejects a comparison the evaluator does not implement', async () => {

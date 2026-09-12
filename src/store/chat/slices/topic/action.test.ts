@@ -38,6 +38,14 @@ vi.mock('@/libs/swr', async () => {
   };
 });
 
+vi.mock('swr', async () => {
+  const actual = await vi.importActual('swr');
+  return {
+    ...(actual as any),
+    mutate: vi.fn(),
+  };
+});
+
 // Mock topicService 和 messageService
 vi.mock('@/services/topic', () => ({
   topicService: {
@@ -243,15 +251,6 @@ describe('topic action', () => {
     });
   });
   describe('refreshTopic', () => {
-    beforeEach(() => {
-      vi.mock('swr', async () => {
-        const actual = await vi.importActual('swr');
-        return {
-          ...(actual as any),
-          mutate: vi.fn(),
-        };
-      });
-    });
     afterEach(() => {
       // 在每个测试用例开始前恢复到实际的 SWR 实现
       vi.resetAllMocks();
@@ -2958,6 +2957,189 @@ describe('topic action', () => {
     });
   });
   describe('summaryTopicTitle', () => {
+    it('should wait for assistant text before summarizing an audio-only conversation', async () => {
+      const topicId = 'topic-1';
+      const messages = [
+        {
+          audioList: [{ alt: 'voice.webm', id: 'audio-1', url: 'https://example.com/voice.webm' }],
+          content: '',
+          id: 'message-1',
+          role: 'user',
+        },
+        { content: LOADING_FLAT, id: 'message-2', role: 'assistant' },
+      ] as UIChatMessage[];
+      const topics = [{ id: topicId, title: '' }] as ChatTopic[];
+      const { result } = renderHook(() => useChatStore());
+
+      await act(async () => {
+        useChatStore.setState({
+          activeAgentId: 'test',
+          topicDataMap: {
+            [topicMapKey({ agentId: 'test' })]: {
+              currentPage: 0,
+              hasMore: false,
+              items: topics,
+              pageSize: 20,
+              total: topics.length,
+            },
+          },
+        });
+      });
+
+      const updateTitleSpy = vi.spyOn(result.current, 'internal_updateTopicTitleInSummary');
+      const generateSpy = vi.spyOn(aiChatService, 'generateJSON');
+
+      await act(async () => {
+        await result.current.summaryTopicTitle(topicId, messages);
+      });
+
+      expect(updateTitleSpy).not.toHaveBeenCalled();
+      expect(generateSpy).not.toHaveBeenCalled();
+    });
+
+    it('should preserve the existing summary behavior for a non-audio attachment-only conversation', async () => {
+      const topicId = 'topic-1';
+      const messages = [
+        {
+          content: '',
+          id: 'message-1',
+          imageList: [{ alt: 'photo.png', id: 'image-1', url: 'https://example.com/photo.png' }],
+          role: 'user',
+        },
+        { content: LOADING_FLAT, id: 'message-2', role: 'assistant' },
+      ] as UIChatMessage[];
+      const topics = [{ id: topicId, title: '' }] as ChatTopic[];
+      const { result } = renderHook(() => useChatStore());
+
+      await act(async () => {
+        useChatStore.setState({
+          activeAgentId: 'test',
+          topicDataMap: {
+            [topicMapKey({ agentId: 'test' })]: {
+              currentPage: 0,
+              hasMore: false,
+              items: topics,
+              pageSize: 20,
+              total: topics.length,
+            },
+          },
+        });
+      });
+
+      const updateTitleSpy = vi.spyOn(result.current, 'internal_updateTopicTitleInSummary');
+      const generateSpy = vi.spyOn(aiChatService, 'generateJSON').mockResolvedValue({
+        data: { title: 'Shared Image' },
+        tracingId: 'tracing-1',
+      } as any);
+
+      await act(async () => {
+        await result.current.summaryTopicTitle(topicId, messages);
+      });
+
+      expect(updateTitleSpy).toHaveBeenCalledWith(topicId, LOADING_FLAT);
+      expect(generateSpy).toHaveBeenCalledOnce();
+      expect(generateSpy.mock.calls[0][0].metadata).toEqual({ topicId });
+    });
+
+    it('should summarize the final answer inside an assistant group for an audio-only conversation', async () => {
+      const topicId = 'topic-1';
+      const finalAnswer = 'The recording asks how to list files in the current directory.';
+      const messages = [
+        {
+          audioList: [{ alt: 'voice.webm', id: 'audio-1', url: 'https://example.com/voice.webm' }],
+          content: '',
+          id: 'message-1',
+          role: 'user',
+        },
+        {
+          children: [
+            {
+              content: 'Analyzing the recording.',
+              id: 'message-2-tool',
+              tools: [{ apiName: 'analyzeMedia', id: 'tool-1' }],
+            },
+            { content: finalAnswer, id: 'message-2-answer' },
+          ],
+          content: '',
+          id: 'message-2',
+          role: 'assistantGroup',
+        },
+      ] as UIChatMessage[];
+      const topics = [{ id: topicId, title: '' }] as ChatTopic[];
+      const { result } = renderHook(() => useChatStore());
+
+      await act(async () => {
+        useChatStore.setState({
+          activeAgentId: 'test',
+          topicDataMap: {
+            [topicMapKey({ agentId: 'test' })]: {
+              currentPage: 0,
+              hasMore: false,
+              items: topics,
+              pageSize: 20,
+              total: topics.length,
+            },
+          },
+        });
+      });
+
+      const generateSpy = vi.spyOn(aiChatService, 'generateJSON').mockResolvedValue({
+        data: { title: 'List Current Directory Files' },
+        tracingId: 'tracing-1',
+      } as any);
+
+      await act(async () => {
+        await result.current.summaryTopicTitle(topicId, messages);
+      });
+
+      const promptMessages = generateSpy.mock.calls[0][0].messages;
+      expect(promptMessages.at(-1)?.content).toContain(finalAnswer);
+    });
+
+    it('should deduplicate concurrent title requests for the same topic', async () => {
+      const topicId = 'topic-1';
+      const messages = [{ content: 'Hello', id: 'message-1', role: 'user' }] as UIChatMessage[];
+      const topics = [{ id: topicId, title: 'Default Topic' }] as ChatTopic[];
+      const { result } = renderHook(() => useChatStore());
+
+      await act(async () => {
+        useChatStore.setState({
+          activeAgentId: 'test',
+          topicDataMap: {
+            [topicMapKey({ agentId: 'test' })]: {
+              currentPage: 0,
+              hasMore: false,
+              items: topics,
+              pageSize: 20,
+              total: topics.length,
+            },
+          },
+        });
+      });
+
+      let resolveGeneration!: (value: unknown) => void;
+      const generation = new Promise((resolve) => {
+        resolveGeneration = resolve;
+      });
+      const generateSpy = vi
+        .spyOn(aiChatService, 'generateJSON')
+        .mockReturnValue(generation as any);
+
+      let firstRequest!: Promise<void>;
+      let secondRequest!: Promise<void>;
+      act(() => {
+        firstRequest = result.current.summaryTopicTitle(topicId, messages);
+        secondRequest = result.current.summaryTopicTitle(topicId, messages);
+      });
+
+      expect(generateSpy).toHaveBeenCalledOnce();
+
+      await act(async () => {
+        resolveGeneration({ data: { title: '  ' }, tracingId: 'tracing-1' });
+        await Promise.all([firstRequest, secondRequest]);
+      });
+    });
+
     it('should show a loading placeholder when auto-summarizing a topic without a title', async () => {
       const topicId = 'topic-1';
       const messages = [{ id: 'message-1', content: 'Hello' }] as UIChatMessage[];
@@ -3313,5 +3495,51 @@ describe('topic action', () => {
       expect(next.excludeTriggers).toEqual(['cron', 'eval']);
       expect(next.items.map((i) => i.id)).toEqual(['topic-2']);
     });
+  });
+});
+
+describe('Topic execution save failures', () => {
+  const key = topicMapKey({ agentId: 'agent-execution' });
+  const previous = {
+    executionConfig: { executionTarget: 'device' as const, boundDeviceId: 'device-a' },
+  };
+  const selected = { executionConfig: { executionTarget: 'sandbox' as const } };
+  const setup = () => {
+    useChatStore.setState({
+      activeAgentId: 'agent-execution',
+      topicDataMap: {
+        [key]: {
+          items: [
+            {
+              id: 'topic-execution',
+              title: 'A',
+              createdAt: 1,
+              updatedAt: 1,
+              favorite: false,
+              metadata: previous,
+            },
+          ],
+          currentPage: 1,
+          hasMore: false,
+          pageSize: 20,
+          total: 1,
+        },
+      },
+    });
+    vi.spyOn(useChatStore.getState(), 'refreshTopic').mockRejectedValue(new Error('offline'));
+  };
+  it('restores the saved target if the mutation fails while offline', async () => {
+    setup();
+    vi.spyOn(topicService, 'updateTopicMetadata').mockRejectedValueOnce(new Error('offline'));
+    await expect(
+      useChatStore.getState().updateTopicMetadata('topic-execution', selected),
+    ).rejects.toThrow('offline');
+    expect(useChatStore.getState().topicDataMap[key].items[0].metadata).toEqual(previous);
+  });
+  it('keeps the saved selection if only revalidation fails', async () => {
+    setup();
+    vi.spyOn(topicService, 'updateTopicMetadata').mockResolvedValueOnce([]);
+    await useChatStore.getState().updateTopicMetadata('topic-execution', selected);
+    expect(useChatStore.getState().topicDataMap[key].items[0].metadata).toEqual(selected);
   });
 });

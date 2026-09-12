@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import type { ReactElement } from 'react';
+import { isValidElement, type ReactElement, Suspense } from 'react';
 import type { RouteObject } from 'react-router';
 import { matchRoutes } from 'react-router';
 import { describe, expect, it, vi } from 'vitest';
@@ -20,6 +20,7 @@ import RouteSegmentSkeleton from '@/components/Skeleton/RouteSegment';
 import SettingsPageSkeleton from '@/components/Skeleton/Settings/Page';
 import TasksSkeleton from '@/components/Skeleton/Tasks';
 import TopicsSkeleton from '@/components/Skeleton/Topics';
+import TaskDetailSkeleton from '@/features/AgentTasks/AgentTaskDetail/TaskDetailSkeleton';
 import { WORKSPACE_SETTINGS_TABS } from '@/features/Workspace/workspaceAwarePath';
 import AppShellSkeleton from '@/spa/BootShell/AppShellSkeleton';
 import { createTabRouter } from '@/spa/router/tabRouter';
@@ -282,11 +283,12 @@ describe('desktop router shared definition', () => {
     // `/share/*` moved to the standalone Share app (apps/share).
     expect(webPaths).not.toContain('/share/t');
     expect(webPaths).not.toContain('/share/page');
-    // …and the agent-share visitor surface lives at `/a/:slugOrId`, a sibling
-    // of the main layout on every platform (Web, Electron, and the mobile
-    // router — see mobileRouter.test.tsx).
-    expect(webPaths).toContain('/a/:slugOrId');
-    expect(electronPaths).toContain('/a/:slugOrId');
+    // …and the agent-share visitor surface is no longer defined here: it runs
+    // a visitor's conversation on the creator's account, so it ships with the
+    // deployment that does that accounting and registers itself through
+    // `BusinessDesktopRoutesWithoutMainLayout`.
+    expect(webPaths).not.toContain('/a/:slugOrId/:topicId?');
+    expect(electronPaths).not.toContain('/a/:slugOrId/:topicId?');
     expect(webPaths).not.toContain('/verify');
     expect(webPaths).toContain('/acceptance');
     expect(webPaths).toContain('/onboarding');
@@ -385,12 +387,35 @@ describe('desktop router shared definition', () => {
   );
 
   it.each([
+    ['Web', () => webDesktopRoutes.find((route) => route.path === '/')?.children ?? []],
+    ['Electron', () => createTabRouter('/').routes[0]?.children ?? []],
+  ])('%s declares a skeleton on every lazy main-area page', (_, getRoutes) => {
+    const undeclared: string[] = [];
+    const walk = (routes: RouteObject[], base: string, chain: RouteObject[]) => {
+      for (const route of routes) {
+        const pathname = route.index ? `${base}/(index)` : `${base}/${route.path ?? ''}`;
+        const nextChain = [...chain, route];
+        if (route.children?.length) {
+          walk(route.children, route.index ? base : pathname, nextChain);
+          continue;
+        }
+        const isLazyPage = isValidElement(route.element) && route.element.type === Suspense;
+        if (isLazyPage && !resolveRouteSkeleton(nextChain)) undeclared.push(pathname);
+      }
+    };
+    walk(getRoutes(), '', []);
+
+    expect(undeclared).toEqual([]);
+  });
+
+  it.each([
     ['Web', (_pathname: string) => webDesktopRoutes],
     ['Electron', (pathname: string) => createTabRouter(pathname).routes],
   ])('%s resolves specialized skeletons from the deepest route meta', (_, getRoutes) => {
     for (const [pathname, expectedSkeleton] of [
       ['/agent/agent-1/topics', TopicsSkeleton],
       ['/agent/agent-1/tasks', TasksSkeleton],
+      ['/agent/agent-1/task/task-1', TaskDetailSkeleton],
       ['/agent/agent-1/goals', GoalSkeleton],
       ['/agent/agent-1/goal/goal-1', GoalDetailSkeleton],
       ['/agent/agent-1/profile', ProfileSkeleton],
@@ -524,16 +549,12 @@ describe('desktop router shared definition', () => {
   it.each([
     ['Web', webDesktopRoutes],
     ['Electron', electronDesktopRoutes],
-  ])(
-    '%s serves the agent-share visitor page on /a/:slugOrId outside the main layout',
-    (_, routes) => {
-      const matches = matchRoutes(routes, '/a/my-bot');
-
-      expect(matches).toHaveLength(1);
-      expect(matches?.[0]?.route.path).toBe('/a/:slugOrId');
-      expect(matches?.[0]?.params).toMatchObject({ slugOrId: 'my-bot' });
-    },
-  );
+  ])('%s leaves the agent-share visitor surface to the business routes', (_, routes) => {
+    // The open-source tree no longer defines `/a/*`; a deployment that offers
+    // agent sharing contributes it through the business slot, so the path
+    // falls through to not-found here.
+    expect(matchRoutes(routes, '/a/my-bot')?.at(-1)?.route.path).toBe('*');
+  });
 
   it('keeps business resource and task routes in the shared definition', async () => {
     const [sharedSource] = await readRouterSources();
